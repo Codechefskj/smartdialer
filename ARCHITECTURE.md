@@ -1,50 +1,101 @@
-# SmartDialer — Architecture & Decisions
+# SmartDialer Architecture
 
-## 1. Stack choice
+## 1. Overview
 
-**Python 3 + standard library for the application, pytest for tests.**
+SmartDialer is a small, runnable prototype for a collections use case.
 
-The assignment is a prototype, so the implementation uses an in-memory store. This keeps the important concurrency, state-machine, pacing, safety, and failure-handling logic easy to run locally without requiring PostgreSQL, Redis, Kafka, or other infrastructure.
+The system supports two dialing strategies:
 
-| Question | Decision |
-|---|---|
-| What did you choose? | Python, threads, dataclasses/enums, and an in-memory Store. |
-| Why? | Easy to run locally and easy to inspect during a technical discussion. |
-| What problem does it solve? | Demonstrates the core SmartDialer correctness rules without infrastructure overhead. |
-| What does it make harder? | It proves coordination only inside one process; production needs shared durable state and distributed leases. |
+- Progressive dialing
+- Predictive dialing
 
----
+The key architectural rule is:
+
+> The predictive pacing engine can suggest how many calls should be started, but it cannot directly place a telecom call.
+
+The mandatory flow is:
+
+```text
+Campaign
+   ↓
+Pacing Engine (Progressive / Predictive)
+   ↓
+Safety Controller
+   ↓
+Call Allocator
+   ↓
+Telecom Provider
+```
 
 ## 2. Architecture
 
-The repository also contains `architecture.png`, which is the primary diagram and does not depend on Mermaid rendering support.
+![SmartDialer Architecture](architecture.png)
 
-![SmartDialer architecture](architecture.png)
+### Component Responsibilities
 
-### Mermaid version
+#### Campaign
 
-```mermaid
-flowchart LR
-    C[Campaign] --> P[Pacing Engine]
-    P --> PP[Progressive Pacer]
-    P --> PR[Predictive Pacer]
-    PP --> S[Safety Controller]
-    PR --> S
-    S --> A[Call Allocator]
-    A --> ST[Store]
-    A --> T[Telecom Provider]
-    T --> PA[Provider A]
-    T --> PB[Provider B]
-    PA --> W[Worker Event Handler]
-    PB --> W
-    W --> ST
-    W --> P
-    W --> S
-```
+Contains campaign-level configuration:
 
-The predictive pacer has no provider or allocator reference. It returns a pacing suggestion. The worker passes that suggestion through `SafetyController.evaluate()` before the allocator can place a call.
+- Target borrowers
+- Answer-rate model
+- Talk-time model
+- Safety settings
+- Provider settings
 
-The Safety Controller is therefore a hard boundary:
+The campaign does not directly place calls.
+
+#### Pacing Engine
+
+The pacing engine decides how many calls it would like to start.
+
+It has two implementations:
+
+- `ProgressivePacer`
+- `PredictivePacer`
+
+The pacing engine only produces a pacing suggestion. It cannot call the telecom provider directly.
+
+#### Safety Controller
+
+The Safety Controller is the mandatory safety boundary. It receives a pacing suggestion and decides whether to `APPROVE`, `REDUCE`, `REJECT`, or `FALLBACK`.
+
+It considers:
+
+- Available agent capacity
+- Reserved capacity
+- In-flight calls
+- Connected calls
+- Provider health
+- Safety buffer
+- Predictive capacity tokens
+
+The predictive algorithm cannot bypass this controller.
+
+#### Call Allocator
+
+The Call Allocator:
+
+1. Selects a borrower.
+2. Selects an agent when required.
+3. Reserves resources.
+4. Creates the call.
+5. Invokes the telecom provider.
+6. Processes provider events.
+7. Releases resources when the call finishes or fails.
+
+#### Telecom Provider
+
+The application uses a provider interface so the dialer does not depend on provider-specific behavior.
+
+Two mock providers are implemented:
+
+- Provider A — fast and reliable.
+- Provider B — slower and unreliable.
+
+Provider B can simulate timeouts, duplicate events, out-of-order events, and provider failures.
+
+## 3. Main Request Flow
 
 ```text
 Campaign
@@ -56,423 +107,563 @@ Pacing Engine
    v
 Safety Controller
    |
-   | approved: M calls
+   | APPROVE / REDUCE / REJECT / FALLBACK
    v
 Call Allocator
+   |
+   +----> Borrower
+   |
+   +----> Agent
    |
    v
 Telecom Provider
 ```
 
----
+The Pacing Engine cannot directly invoke the Telecom Provider. Only the Call Allocator invokes the provider after the Safety Controller has approved the requested capacity.
 
-## 3. Agent state machine
+## 4. Progressive Dialing
 
-```mermaid
-stateDiagram-v2
-    [*] --> OFFLINE
-    OFFLINE --> AVAILABLE
-    AVAILABLE --> RESERVED
-    AVAILABLE --> PAUSED
-    AVAILABLE --> OFFLINE
-    RESERVED --> DIALING
-    RESERVED --> CONNECTED
-    RESERVED --> AVAILABLE
-    RESERVED --> OFFLINE
-    DIALING --> CONNECTED
-    DIALING --> AVAILABLE
-    DIALING --> OFFLINE
-    CONNECTED --> WRAP_UP
-    CONNECTED --> OFFLINE
-    WRAP_UP --> AVAILABLE
-    WRAP_UP --> PAUSED
-    WRAP_UP --> OFFLINE
-    PAUSED --> AVAILABLE
-    PAUSED --> OFFLINE
-```
-
-Equivalent lifecycle:
+Progressive dialing follows:
 
 ```text
-OFFLINE
-   |
-   v
-AVAILABLE <--------+
-   |               |
-   v               |
-RESERVED           |
-   |               |
-   v               |
-DIALING -----------+
-   |
-   v
-CONNECTED
-   |
-   v
-WRAP_UP
-   |
-   +----> AVAILABLE
-   |
-   +----> PAUSED
-   |
-   +----> OFFLINE
+1 available agent
+       |
+       v
+1 outbound call
 ```
 
-### Important invariant
+If there are 50 available agents, the progressive dialer does not create more than 50 agent-bound calls.
 
-Two workers must never reserve the same agent. `Store.reserve_any_available_agent()` uses a per-agent lock and re-checks the state while holding the lock.
-
-For production, the same invariant should move to a shared datastore using an atomic update or a database row lock such as `SELECT ... FOR UPDATE SKIP LOCKED`.
-
----
-
-## 4. Call state machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> QUEUED
-    QUEUED --> RESERVED
-    RESERVED --> INITIATED
-    INITIATED --> RINGING
-    RINGING --> ANSWERED
-    ANSWERED --> CONNECTED
-    CONNECTED --> COMPLETED
-    RESERVED --> FAILED
-    INITIATED --> FAILED
-    RINGING --> FAILED
-    RESERVED --> CANCELLED
-    INITIATED --> CANCELLED
-    RINGING --> CANCELLED
-    ANSWERED --> CANCELLED
-    CONNECTED --> CANCELLED
-    RINGING --> ABANDONED
-```
-
-The implementation uses two protections:
-
-1. Provider event IDs make exact duplicate events idempotent.
-2. Monotonic state ranks prevent lower-ranked late events from moving a call backwards.
-
-For example:
+The normal sequence is:
 
 ```text
-COMPLETED -> ANSWERED -> RINGING
+AVAILABLE → RESERVED → DIALING → CONNECTED → WRAP_UP → AVAILABLE
 ```
 
-leaves the call at `COMPLETED`.
+If call setup fails, the agent reservation is released and the agent returns to `AVAILABLE`.
 
-Provider B can also produce:
+## 5. Predictive Dialing
+
+Predictive dialing attempts to improve agent utilization by starting calls before an agent becomes free.
+
+The predictive pacer considers:
+
+- Current agent availability
+- Calls already in progress
+- Historical answer rate
+- Average call duration
+- Provider health
+- Recent campaign behavior
+
+A simplified calculation is:
 
 ```text
-RINGING -> CONNECTED -> ANSWERED
+expected_calls_per_agent = 1 / answer_rate
 ```
 
-The implementation treats `CONNECTED` as an answer-time safety point and performs agent binding there, so the later `ANSWERED` event cannot leave a connected call without an agent.
+The result is adjusted using safety limits and provider health. The predictive pacer can suggest additional calls, but the final decision belongs to the Safety Controller.
 
----
-
-## 5. Concurrency and allocation
-
-### Agent reservation
-
-`Store.reserve_any_available_agent()`:
-
-1. finds a candidate agent;
-2. obtains that agent's lock;
-3. re-checks that the state is still `AVAILABLE`;
-4. changes it to `RESERVED` atomically inside the lock.
-
-Therefore, if two workers see the same agent:
+## 6. Safety Controller
 
 ```text
-Worker 1 ----\
-              +---- agent lock ----> exactly one RESERVED
-Worker 2 ----/
+Predictive Pacer
+      |
+      | "I want N calls"
+      v
+Safety Controller
+      |
+      +---- capacity check
+      +---- provider health check
+      +---- in-flight call check
+      +---- safety buffer
+      |
+      v
+APPROVE / REDUCE / REJECT / FALLBACK
 ```
 
-The borrower queue has its own lock so two workers cannot reserve the same pending borrower.
+The predictive model is allowed to be wrong; the safety boundary is not.
 
-### Predictive capacity ledger
+### Safety invariant
 
-A simple `approved <= available_agents` check is not enough with multiple workers. Both workers could read the same available count before either starts a call.
+> A predictive call cannot enter `ANSWERED` or `CONNECTED` unless an agent has been atomically reserved for it.
 
-The Safety Controller therefore maintains a shared predictive in-flight counter protected by a lock:
+The answer-time safety gate is required because agent availability can change after pacing approval. If a predictive call answers and no agent can be reserved, the worker cancels the call instead of recording an abandoned connected call.
 
-```text
-10 available agents
+## 7. Predictive Capacity Ledger
 
-Worker 1 requests 10
-    -> approves 10
-    -> reserved predictive capacity = 10
-
-Worker 2 requests 10
-    -> approves 0
-```
-
-When a predictive call reaches a terminal state, its capacity token is released. If fewer calls are actually started than were approved, unused tokens are returned immediately.
-
-This is a prototype implementation. Production would put the same invariant into a shared durable store or distributed lease mechanism.
-
----
-
-## 6. Deterministic safety boundary
-
-Predictive pacing may be aggressive, but safety is deterministic.
-
-The Safety Controller applies these checks:
-
-1. shared predictive-capacity limit;
-2. abandonment circuit breaker;
-3. progressive fallback when predictive mode is disabled;
-4. provider-health reduction;
-5. ramp-rate limiting.
-
-### Answer-time safety gate
-
-Pacing happens before the provider answers, so an agent can disappear after a pacing decision. Therefore the final safety check happens when a predictive call reaches `ANSWERED` or `CONNECTED`.
+Predictive calls use capacity tokens. A predictive approval consumes a capacity token, while terminal completion, failure, or cancellation releases it.
 
 ```text
-Predictive call answers
+Available safety capacity
         |
         v
-Try atomic agent reservation
+Capacity Ledger
         |
-   +----+----+
-   |         |
- success    failure
-   |         |
-   v         v
-CONNECT   CANCEL
-           |
-           v
-     never record
-     unsafe connected call
+        +---- Worker 1
+        +---- Worker 2
+        +---- Worker N
 ```
 
-If no agent can be reserved, the call is cancelled instead of being allowed into an unsafe connected state.
+The ledger is shared so concurrent workers cannot independently approve the same capacity.
 
-The mock providers model cancellation as a terminal event. A real telecom provider may make cancellation best-effort; later provider events are then ignored once the call is terminal.
+## 8. Agent State Machine
 
----
+![Agent State Machine](agent_state_machine.png)
 
-## 7. Progressive dialing
-
-Progressive mode reserves a real agent before placing an outbound call.
+The agent lifecycle is:
 
 ```text
-AVAILABLE agent
+OFFLINE → AVAILABLE → RESERVED → DIALING → CONNECTED → WRAP_UP → AVAILABLE
+```
+
+An agent can also move between `AVAILABLE` and `PAUSED`, and from `AVAILABLE` or `PAUSED` to `OFFLINE`.
+
+| State | Meaning |
+|---|---|
+| `OFFLINE` | Agent is offline / not available |
+| `AVAILABLE` | Agent is ready to receive a call |
+| `RESERVED` | Agent has been selected for a call |
+| `DIALING` | Outbound call is being established |
+| `CONNECTED` | Agent is handling a connected borrower |
+| `WRAP_UP` | Post-call work is in progress |
+| `PAUSED` | Agent is temporarily unavailable |
+
+## 9. Call State Machine
+
+![Call State Machine](call_state_machine.png)
+
+The normal call lifecycle is:
+
+```text
+QUEUED → RESERVED → INITIATED → RINGING → ANSWERED → CONNECTED → COMPLETED
+```
+
+Failure and cancellation paths are also supported.
+
+| State | Meaning |
+|---|---|
+| `QUEUED` | Borrower is waiting to be called |
+| `RESERVED` | Required resources have been reserved |
+| `INITIATED` | Call request was sent to provider |
+| `RINGING` | Borrower phone is ringing |
+| `ANSWERED` | Borrower answered |
+| `CONNECTED` | Call is connected with an agent |
+| `COMPLETED` | Call ended normally |
+| `FAILED` | Call failed or timed out |
+| `CANCELLED` | Call was cancelled |
+
+## 10. Concurrency
+
+Multiple workers may attempt to allocate the same agent simultaneously.
+
+Only one worker may successfully perform:
+
+```text
+AVAILABLE → RESERVED
+```
+
+The prototype uses locking and a state re-check:
+
+```text
+Acquire lock
+    |
+    v
+Check agent == AVAILABLE
+    |
+    v
+Change to RESERVED
+    |
+    v
+Release lock
+```
+
+For a multi-process or multi-machine deployment, an in-memory lock is not sufficient. A production implementation would use durable shared state such as PostgreSQL row-level locking or an equivalent distributed lease.
+
+## 11. Borrower Allocation
+
+Borrowers must also be protected from duplicate allocation.
+
+Workers must atomically claim borrowers so multiple workers do not create duplicate active calls for the same borrower.
+
+## 12. Duplicate Provider Events
+
+External providers cannot be assumed to behave perfectly.
+
+Example:
+
+```text
+ANSWERED
+ANSWERED
+ANSWERED
+COMPLETED
+```
+
+Provider events are idempotent by event identifier. Repeated events do not create duplicate logical state transitions.
+
+## 13. Out-of-Order Provider Events
+
+Providers may send events out of order, for example:
+
+```text
+COMPLETED
+ANSWERED
+RINGING
+```
+
+The call state machine uses state ordering so stale lower-ranked events cannot move a call backwards.
+
+```text
+QUEUED < RESERVED < INITIATED < RINGING < ANSWERED < CONNECTED < COMPLETED
+```
+
+The implementation also handles a provider reporting `CONNECTED` before `ANSWERED`; the answer-time agent reservation requirement must still be satisfied before the call is treated as safely connected.
+
+## 14. Worker Crash Recovery
+
+Consider:
+
+```text
+Agent reserved
+      ↓
+Borrower reserved
+      ↓
+Call initiated
+      ↓
+Worker crashes
+```
+
+Agent and borrower reservations carry lease information. A reconciliation process detects stale reservations and releases or reconciles them.
+
+The system reconciles agent state, borrower state, call state, and capacity tokens.
+
+Calls that were initiated but never produce an expected provider event are recovered by the call setup timeout.
+
+## 15. Provider Timeout
+
+A provider may accept a request but fail to produce an expected event.
+
+```text
+INITIATED / RINGING
+        |
+        | timeout
+        v
+      FAILED
+        |
+        v
+release resources
+        |
+        v
+retry if allowed
+```
+
+Retries are bounded. Before retrying, agent reservations and capacity tokens are released and the borrower is returned to `PENDING` when appropriate.
+
+## 16. Provider Outage
+
+When provider health deteriorates:
+
+```text
+Provider health
       |
       v
-RESERVED agent
+Safety Controller
       |
-      v
-DIALING
-      |
-      v
-Provider
+      +---- reduce new calls
+      +---- reject new calls
+      +---- fallback to progressive
 ```
 
-Therefore, with 50 available agents, progressive mode cannot create more than 50 agent-bound outbound calls at the same time.
+Existing calls are allowed to finish where possible. New calls are reduced or stopped depending on provider health. Retries are bounded so an outage does not create a retry storm.
 
-If call setup fails, the agent is released and the borrower can be retried according to the retry policy.
+## 17. Provider A
 
-If the agent disappears during setup, the reservation is released and the call is cancelled/fails safely.
+Provider A represents a healthy provider:
 
----
+- Fast
+- Reliable
+- Low failure rate
+- Normal event ordering
 
-## 8. Predictive pacing
+## 18. Provider B
 
-`PredictivePacer` uses an explainable rule-based model rather than ML.
+Provider B represents an unreliable provider and can simulate:
+
+- Higher latency
+- Timeouts
+- Duplicate events
+- Out-of-order events
+- Provider failures
+
+The dialer interacts with Provider B through the common provider interface.
+
+## 19. Retry Strategy
+
+Retries are bounded:
 
 ```text
-raw_ratio = 1 / max(answer_rate, 0.02)
-ratio = clamp(raw_ratio, 1.0, 4.0)
-ratio *= safety_margin
-ratio *= provider_health
-
-target_concurrent = available_agents * ratio
-suggested_count = clamp(
-    round(target_concurrent - calls_in_flight),
-    0,
-    pending_borrowers
-)
+FAILED
+  |
+  v
+retry_count < max_retries?
+  |
+  +---- NO ----> terminal failure
+  |
+  +---- YES ---> release resources
+                    |
+                    v
+                  PENDING
+                    |
+                    v
+                  retry
 ```
 
-The pacer also tracks EWMA answer rate, average talk time, and setup time.
+A production system should also use exponential backoff and provider-health feedback.
 
-The suggestion includes the inputs and calculated target, so the reviewer can explain why the system suggested a particular number of calls.
+## 20. Scenario Simulation
 
-If observed abandonment exceeds the configured threshold, the Safety Controller disables predictive dialing for a cooldown and falls back to progressive behaviour.
-
----
-
-## 9. Telecom providers
-
-### Provider A
-
-- fast;
-- reliable;
-- low failure rate.
-
-### Provider B
-
-- slower;
-- occasional failures/timeouts;
-- duplicate events;
-- out-of-order events.
-
-The dialer depends only on the provider interface and does not depend on Provider A or Provider B implementation details.
-
-Provider health is fed back into pacing and safety. A degraded provider therefore causes new dialing volume to decrease instead of allowing the predictive engine to continue at the same rate.
-
----
-
-## 10. Failure handling
-
-### 10.1 Worker crash
-
-Agent and borrower reservations have a lease timestamp. `reconcile_stale_reservations()` releases stale reservations and makes stale borrowers available again.
-
-Calls that were initiated but receive no provider event are separately protected by a call setup timeout.
-
-In production, reconciliation should run in an independent worker against durable state so recovery does not depend on the crashed worker returning.
-
-### 10.2 Provider outage
-
-Provider health reduces new approvals. Existing connected calls are not retroactively killed because the provider's health score changed.
-
-If a provider never sends an event, the call setup watchdog transitions the call to a safe terminal state, releases capacity, and makes the borrower eligible for a later retry.
-
-### 10.3 Agent availability suddenly drops
-
-The worker reads current availability on each pacing tick. More importantly, the answer-time safety gate handles the race between a pacing decision and the actual provider answer.
-
-### 10.4 Duplicate events
-
-Exact duplicate event IDs are ignored. A different event ID that carries a lower-ranked state is also ignored.
-
-### 10.5 Out-of-order events
-
-State transitions are monotonic. A later lower-ranked event cannot undo a completed or connected call.
-
-For the Provider B case:
-
-```text
-RINGING -> CONNECTED -> ANSWERED
-```
-
-agent binding occurs at the connected safety point, and the late `ANSWERED` event is idempotent.
-
----
-
-## 11. Retry and timeout handling
-
-A failed or timed-out attempt follows this lifecycle:
-
-```text
-FAILED / CANCELLED / timeout
-          |
-          v
-release agent/capacity
-          |
-          v
-increment retry count
-          |
-     +----+----+
-     |         |
- retries left  exhausted
-     |         |
-     v         v
-PENDING       final failure
-```
-
-Retries are bounded by `max_retries` so a provider outage cannot create an infinite retry loop.
-
----
-
-## 12. Simulation scenarios
-
-The simulator implements the assignment's A/B/C/D scenarios.
+The simulator evaluates the assignment scenarios:
 
 | Scenario | Answer rate | Average talk time |
 |---|---:|---:|
-| A | 20% | 120 simulated seconds |
-| B | 50% | 90 simulated seconds |
-| C | 70% | 180 simulated seconds |
-| D | changing | changing |
+| A | 20% | 120 seconds |
+| B | 50% | 90 seconds |
+| C | 70% | 180 seconds |
+| D | Changing | Changing |
 
-For fast local execution, the simulator scales those durations down while preserving their relative relationships.
+The laptop simulation scales talk time down while preserving the relative A/B/C relationships. Scenario D changes both answer rate and talk time during the run.
 
-Scenario D changes both answer rate and talk time during the run.
+The simulator reports calls initiated, connected, completed, failed, abandoned, average agent utilization, and Safety Controller decisions.
 
-The simulation reports:
+## 21. Load Testing
 
-- agent utilization;
-- calls initiated;
-- calls connected;
-- calls completed;
-- calls failed/cancelled;
-- abandoned calls;
-- pacing suggestions and approvals;
-- Safety Controller decisions.
+The prototype includes a reservation load test for:
 
-Provider B can be selected to demonstrate latency, failures, duplicates, and out-of-order events.
+```text
+100 agents
+1,000 agents
+10,000 agents
+```
 
----
+The prototype deliberately uses a linear in-memory scan. This is acceptable for demonstrating the algorithm, while production indexing/database changes would remove this bottleneck.
 
-## 13. Load and scale
+## 22. Scaling
 
-The prototype load test exercises agent reservation at:
+### 100 agents
 
-- 100 agents;
-- 1,000 agents;
-- 10,000 agents.
+A single process with the in-memory prototype can be sufficient. The main concern is correctness.
 
-| Scale | First bottleneck | Why | Production change |
-|---|---|---|---|
-| 100 agents | None significant | Small in-memory scans. | Keep simple model. |
-| 1,000 agents | Linear scans | Reservation may inspect many records. | Indexed available/pending sets or database indexes. |
-| 10,000 agents | Single-process CPU and memory | All state is local and threads share one process. | Shared durable store plus multiple workers. |
-| 10,000+ / high event volume | Event ingestion | A single process cannot safely absorb unlimited provider events. | Queue provider events and process them with idempotent consumers. |
+### 1,000 agents
 
-The scalability mechanism should not weaken the core safety invariant: agent allocation and predictive capacity need a shared source of truth.
+Increase workers and move important shared state toward durable storage. Potential bottlenecks include agent allocation, borrower allocation, event processing, and provider throughput.
 
----
+### 10,000 agents
 
-## 14. Why not Kafka, Redis, or PostgreSQL in the prototype?
+A single shared lock or single database transaction path can become a bottleneck. Partition work by campaign or agent groups and distribute provider calls and event processing.
 
-The assignment explicitly says there is no required infrastructure stack. The important part is the reasoning and correctness of the SmartDialer behaviour.
+### Larger scale
 
-Adding infrastructure would increase setup complexity without being necessary to demonstrate the core logic.
+At larger scale:
 
-The Store interface is intentionally shaped around production operations such as:
+- Partition campaigns
+- Partition agents
+- Partition borrowers
+- Partition event processing
+- Use durable queues
+- Use database partitioning where required
+- Maintain distributed capacity accounting
+- Isolate provider integrations
 
-- atomic reservation;
-- leases;
-- versioned state;
-- idempotent event handling;
-- reconciliation.
+Workers can scale horizontally without weakening the Safety Controller.
 
-A production implementation can replace the in-memory Store with PostgreSQL/Redis without changing the main pacing/safety architecture.
+## 23. Observability
 
----
+Important metrics include:
 
-## 15. Architecture decisions
+```text
+agent_available
+agent_reserved
+agent_connected
 
-| Decision | Benefit | Trade-off |
-|---|---|---|
-| Predictive pacer cannot call provider | Makes safety boundary enforceable | Adds an explicit control step |
-| Safety Controller owns capacity | Prevents multiple workers from approving the same predictive capacity | Requires shared coordination |
-| Answer-time agent reservation | Protects against availability changing after pacing | Can cancel a call after it has already answered |
-| Monotonic call states | Handles duplicate/out-of-order events | Some provider events become no-ops |
-| Lease-based recovery | Recovers from worker crashes | Requires reconciliation |
-| Mock provider interface | Tests provider failure independently | Not a real telecom integration |
-| In-memory Store | Easy local setup | Not durable or cross-process |
+calls_queued
+calls_initiated
+calls_ringing
+calls_connected
+calls_completed
+calls_failed
+calls_abandoned
 
----
+provider_latency
+provider_failure_rate
 
-## 16. Final answer
+pacing_requested
+pacing_approved
+pacing_reduced
+pacing_rejected
 
-**How would I build a SmartDialer that gets as much of the utilization benefit of predictive dialing as possible while retaining the deterministic safety characteristics of progressive dialing?**
+retry_count
+stale_reservations
+```
 
-I would make prediction an advisory layer only. The predictive engine estimates how many calls should be started using live answer rate, talk time, setup time, and provider health, but it cannot call the provider directly. A shared Safety Controller owns the hard capacity boundary and can approve, reduce, reject, or fall back to progressive behaviour. Finally, every predictive answer goes through an atomic agent-reservation check before the call is allowed into a connected state. This final check is essential because agent availability can change after the pacing decision. The result is aggressive dialing when conditions are favourable, while the safety boundary remains deterministic when predictions, workers, or providers behave badly.
+Logs should include worker ID, agent ID, borrower ID, call ID, provider event ID, state transition, and safety decision.
+
+## 24. Idempotency
+
+Idempotency is required because workers and providers can repeat work.
+
+The system uses identifiers such as:
+
+```text
+call_id
+event_id
+worker_id
+```
+
+A provider event is processed once logically even if it is delivered multiple times.
+
+## 25. Important Invariants
+
+### Agent invariant
+
+> An agent can be reserved by at most one active call.
+
+### Borrower invariant
+
+> A borrower cannot have multiple active outbound calls.
+
+### Safety invariant
+
+> Predictive pacing cannot bypass the Safety Controller.
+
+### Provider invariant
+
+> Provider-specific behavior is hidden behind the provider interface.
+
+### Event invariant
+
+> Duplicate events do not create duplicate state transitions.
+
+### State invariant
+
+> Terminal call states cannot be moved backwards by stale events.
+
+### Recovery invariant
+
+> Worker failure must not permanently leak reservations.
+
+### Answer-time safety invariant
+
+> A call cannot become safely `CONNECTED` without an agent reservation.
+
+## 26. Architecture Decisions
+
+### Why Python?
+
+Python was selected because this is a small functional prototype and Python allows the concurrency, state-machine, simulation, and testing logic to be implemented clearly with minimal infrastructure.
+
+### Why asyncio?
+
+The prototype contains simulated I/O-style operations and provider events. `asyncio` allows multiple simulated workers to execute concurrently without introducing unnecessary infrastructure.
+
+### Why no Kafka/Redis?
+
+The assignment does not require Kafka, Redis, or microservices. For the prototype, in-process structures are enough to demonstrate the core logic.
+
+A production deployment would move critical shared state and leases into durable shared infrastructure.
+
+### What does the simple design make harder?
+
+The prototype does not provide true distributed durability across multiple machines. In production, agent reservations, borrower reservations, the capacity ledger, event deduplication, and worker leases would need durable implementations.
+
+## 27. Failure Handling Summary
+
+| Failure | Expected behavior |
+|---|---|
+| Worker crash | Expired leases are reconciled |
+| Provider timeout | Call times out and resources are released |
+| Provider outage | New dialing is reduced/rejected |
+| Duplicate event | Event is ignored after first processing |
+| Out-of-order event | Invalid backward transition is ignored |
+| Agent availability drop | Capacity is recalculated |
+| Call failure | Resources are released and retry is bounded |
+| High answer rate | Safety Controller limits capacity |
+| Low answer rate | Predictive pacing reduces unnecessary dialing |
+
+## 28. Assignment Coverage
+
+This prototype covers the requested assignment areas:
+
+- Working source code
+- README and local setup instructions
+- Architecture diagram
+- Agent state machine
+- Call state machine
+- Progressive Dialer
+- Predictive Pacing Engine
+- Safety Controller
+- Mock telecom Provider A
+- Mock telecom Provider B
+- Concurrency protection
+- Borrower allocation
+- Duplicate event handling
+- Out-of-order event handling
+- Worker crash recovery
+- Provider outage handling
+- Provider timeout handling
+- Retry handling
+- Agent availability changes
+- Scenarios A/B/C/D
+- Basic simulation
+- Basic load test
+- Architecture decision documentation
+- Automated tests
+
+## 29. Final Design Principle
+
+```text
+Predictive intelligence
+        +
+Deterministic safety boundary
+        =
+Safe utilization improvement
+```
+
+The predictive engine is allowed to estimate. The Safety Controller is responsible for enforcing.
+
+```text
+Predictive Pacer
+      |
+      | suggestion
+      v
+Safety Controller
+      |
+      | approved capacity
+      v
+Call Allocator
+      |
+      v
+Telecom Provider
+```
+
+The predictive model can be changed, improved, or replaced without giving it the ability to bypass the safety boundary.
+
+## 30. Final Answer
+
+I would build the SmartDialer as a hybrid system where predictive pacing is used to improve utilization, but every pacing decision passes through a deterministic Safety Controller.
+
+Progressive dialing provides the baseline safe behavior:
+
+```text
+one available agent → one outbound call
+```
+
+Predictive pacing estimates how many additional calls may be useful based on answer rate, agent availability, call duration, in-flight calls, and provider health.
+
+However, the predictive engine cannot directly place a call. It only produces a suggestion.
+
+The Safety Controller evaluates that suggestion against current system capacity and provider health. It can approve, reduce, reject, or fall back to progressive behavior.
+
+Agent and borrower allocation are protected against concurrent workers. Provider events are processed idempotently, and out-of-order events cannot move a call backwards into an invalid state.
+
+Worker leases, call timeouts, bounded retries, provider health checks, and reconciliation prevent failures from permanently leaking resources.
+
+This gives the system most of the utilization benefit of predictive dialing while retaining the deterministic safety characteristics of progressive dialing.
